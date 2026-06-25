@@ -366,12 +366,13 @@ function zoomIntoPortal(targetPos, w, h, textureIndex) {
     currentGridCenter.copy(newCenter);
     currentZoomLevels = calculateZoomLevels(gridW, gridH);
     
-    // If looping, we animate perfectly into the newly spawned macro view.
+    // Animate perfectly into the newly spawned macro view.
     currentZoomIndex = 3; 
     const targetCameraZ = currentGridCenter.z + currentZoomLevels[3];
     
-    console.log(`[Deep Zoom] Animating camera to Z: ${targetCameraZ}`);
+    console.log(`[Deep Zoom] Preparing to animate camera to Z: ${targetCameraZ}`);
 
+    // Execute the GSAP tween
     gsap.to(camera.position, {
       x: currentGridCenter.x,
       y: currentGridCenter.y,
@@ -383,7 +384,7 @@ function zoomIntoPortal(targetPos, w, h, textureIndex) {
           if (isLoopPortal) {
             console.log(`[Deep Zoom] Animation complete. Triggering instant Teleport...`);
             
-            // THE TELEPORT: Instantly and silently snap back to the Global Master Grid
+            // THE TELEPORT: Instantly snap back to the Global Master Grid
             const rootGrid = gridStack[0];
             currentGrid = rootGrid;
             currentGridCenter.copy(rootGrid.center);

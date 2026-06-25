@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "puppeteer": "^25.2.1",
     "vite": "^5.0.0"
   },
   "dependencies": {
