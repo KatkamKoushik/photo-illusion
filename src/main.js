@@ -1,29 +1,29 @@
 import './style.css';
 import * as THREE from 'three';
 import gsap from 'gsap';
+import { ScrollTrigger } from 'gsap/ScrollTrigger';
 
-let targetTexture;
+gsap.registerPlugin(ScrollTrigger);
+
+// Configuration
+const SCALE_FACTOR = 0.005; // Extreme micro-scaling for nested layers
+const GRID_ROWS = 150;
+const BASE_CAMERA_Z = 12;
+
+// State
+let loadedTextures = [];
+let imageAspects = [];
+let targetTexture = null;
 let targetAspect = 1.0;
-const loadedTextures = [];
-const imageAspects = [];
-
-let currentZoomIndex = 3;
-let isAnimating = false;
-let currentGridCenter = new THREE.Vector3(0, 0, 0);
-let currentZoomLevels = [];
-let zoomPath = [];
-let currentGrid;
-const gridStack = [];
+let currentGrid = null;
+let sequenceLayers = [];
 
 // Scene Setup
 const container = document.getElementById('app');
 const scene = new THREE.Scene();
 
-// Camera
-const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.0001, 20000);
-
-// Renderer
-const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.00001, 100000);
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, logarithmicDepthBuffer: true });
 renderer.setClearColor(0x000000, 1.0);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -32,21 +32,14 @@ container.appendChild(renderer.domElement);
 const vertexShader = `
   varying vec2 vUv;
   varying vec2 vTargetUv;
-
   uniform vec2 uBoundsMin;
   uniform vec2 uBoundsSize;
   uniform vec2 uUvScale;
-
   void main() {
     vUv = uv;
     vec4 worldPos = instanceMatrix * vec4(position, 1.0);
-    
-    // Normalize world position to 0-1 range based on layout bounds for target illustration mapping
     vec2 targetUv = (worldPos.xy - uBoundsMin) / uBoundsSize;
-    
-    // Object-fit: cover scaling
     vTargetUv = (targetUv - 0.5) * uUvScale + 0.5;
-    
     vec4 mvPosition = viewMatrix * worldPos;
     gl_Position = projectionMatrix * mvPosition;
   }
@@ -55,15 +48,11 @@ const vertexShader = `
 const fragmentShader = `
   varying vec2 vUv;
   varying vec2 vTargetUv;
-
   uniform sampler2D uTexture;
   uniform sampler2D uTargetTexture;
   uniform float uTintOpacity;
 
-  float getLuminance(vec3 color) {
-    return dot(color, vec3(0.299, 0.587, 0.114));
-  }
-
+  float getLuminance(vec3 color) { return dot(color, vec3(0.299, 0.587, 0.114)); }
   vec3 blendHardLight(vec3 base, vec3 blend) {
     return mix(
       2.0 * base * blend,
@@ -74,51 +63,35 @@ const fragmentShader = `
 
   void main() {
     vec4 texColor = texture2D(uTexture, vUv);
-    
-    // Safety clamp to avoid sampling outside bounds
     vec2 safeTargetUv = clamp(vTargetUv, 0.0, 1.0);
     vec4 targetColor = texture2D(uTargetTexture, safeTargetUv);
     
-    // Treat the instanced photo purely as a grayscale texture map
     float photoLum = getLuminance(texColor.rgb);
     vec3 grayscalePhoto = vec3(photoLum);
-    
-    // Hard Light Blend: The target color dictates the lighting.
     vec3 illusionColor = blendHardLight(grayscalePhoto, targetColor.rgb);
-    
-    // Mix the hard-light composite back with the pure target color slightly
-    // to enforce the exact hue and saturation.
     illusionColor = mix(illusionColor, targetColor.rgb, 0.6);
     
-    // Final zoom opacity mix
     gl_FragColor = vec4(mix(texColor.rgb, illusionColor, uTintOpacity), 1.0);
   }
 `;
 
 class PhotoGrid {
-  constructor(center, width, height, densityRows, excludeImageIndices = [], initialOpacity = 0.0) {
+  constructor(center, width, height, densityRows) {
     this.center = center;
     this.width = width;
     this.height = height;
     this.meshes = [];
-    this.uTintOpacity = { value: initialOpacity };
+    this.uTintOpacity = { value: 1.0 };
     
-    let availableIndices = loadedTextures.map((_, i) => i).filter(i => !excludeImageIndices.includes(i));
-    if (availableIndices.length === 0) {
-      availableIndices = loadedTextures.map((_, i) => i);
-      zoomPath = []; // Reset history (safety fallback)
-    }
-
+    const availableIndices = loadedTextures.map((_, i) => i);
     const targetRowHeight = height / densityRows;
     const rowsData = [];
     let currentRow = [];
     let currentRowWidth = 0;
     let currentY = height / 2;
 
-    // Flickr-style packing
     while (currentY > -height / 2) {
-      const texGroupIndex = Math.floor(Math.random() * availableIndices.length);
-      const globalTexIndex = availableIndices[texGroupIndex];
+      const globalTexIndex = availableIndices[Math.floor(Math.random() * availableIndices.length)];
       const aspect = imageAspects[globalTexIndex];
       
       currentRow.push({ index: globalTexIndex, aspect: aspect });
@@ -132,19 +105,14 @@ class PhotoGrid {
         for (let i = 0; i < currentRow.length; i++) {
           const item = currentRow[i];
           let itemWidth = item.aspect * finalRowHeight;
-          
-          if (i === currentRow.length - 1) {
-            itemWidth = (width / 2) - currentX; // Force perfectly flush on right edge
-          }
+          if (i === currentRow.length - 1) itemWidth = (width / 2) - currentX; 
           
           item.w = itemWidth;
           item.h = finalRowHeight;
           item.cx = currentX + itemWidth / 2;
           item.cy = currentY - finalRowHeight / 2;
-          
           currentX += itemWidth;
         }
-        
         rowsData.push(currentRow);
         currentY -= finalRowHeight;
         currentRow = [];
@@ -153,11 +121,7 @@ class PhotoGrid {
     }
 
     const texturePositions = loadedTextures.map(() => []);
-    rowsData.forEach(row => {
-      row.forEach(item => {
-        texturePositions[item.index].push(item);
-      });
-    });
+    rowsData.forEach(row => row.forEach(item => texturePositions[item.index].push(item)));
 
     const geometry = new THREE.PlaneGeometry(1, 1);
     const boundsMin = new THREE.Vector2(center.x - width / 2, center.y - height / 2);
@@ -184,7 +148,9 @@ class PhotoGrid {
           uBoundsMin: { value: boundsMin },
           uBoundsSize: { value: boundsSize },
           uUvScale: { value: uvScale }
-        }
+        },
+        depthWrite: true,
+        depthTest: true
       });
 
       const mesh = new THREE.InstancedMesh(geometry, material, positions.length);
@@ -198,48 +164,30 @@ class PhotoGrid {
       });
 
       mesh.instanceMatrix.needsUpdate = true;
-      mesh.userData = { isGrid: true, texIndex: texIndex };
+      mesh.userData = { isGrid: true, texIndex: texIndex, positions: positions };
       this.meshes.push(mesh);
       scene.add(mesh);
     });
   }
-
-  destroy() {
-    this.meshes.forEach(mesh => {
-      scene.remove(mesh);
-      if (mesh.geometry) mesh.geometry.dispose();
-      if (mesh.material) mesh.material.dispose();
-      if (typeof mesh.dispose === 'function') mesh.dispose();
-    });
-    this.meshes = [];
-  }
-}
-
-function calculateZoomLevels(width, height) {
-  const fovRad = THREE.MathUtils.degToRad(camera.fov / 2);
-  const zFitHeight = height / (2 * Math.tan(fovRad));
-  const zFitWidth = (width / camera.aspect) / (2 * Math.tan(fovRad));
-  const maxZ = Math.max(zFitHeight, zFitWidth);
-  
-  return [
-    maxZ * 0.05, // Super close
-    maxZ * 0.25,
-    maxZ * 0.5,
-    maxZ         // Macro
-  ];
 }
 
 async function init() {
   const tl = new THREE.TextureLoader();
-  targetTexture = await tl.loadAsync('/images/target-illustration.jpg');
-  targetTexture.colorSpace = THREE.SRGBColorSpace;
-  targetAspect = targetTexture.image.width / targetTexture.image.height;
   
   // Dynamic Image Import using Vite glob
   const imageModules = import.meta.glob('../public/images/*.{jpg,jpeg,png,webp}', { eager: true, query: '?url', import: 'default' });
   const allUrls = Object.values(imageModules);
-  const sourceUrls = allUrls.filter(url => !url.includes('target-illustration'));
   
+  // Load target illustration
+  const targetUrl = allUrls.find(url => url.includes('target-illustration'));
+  if (targetUrl) {
+    targetTexture = await tl.loadAsync(targetUrl);
+    targetTexture.colorSpace = THREE.SRGBColorSpace;
+    targetAspect = targetTexture.image.width / targetTexture.image.height;
+  }
+  
+  // Load source images
+  const sourceUrls = allUrls.filter(url => !url.includes('target-illustration')).sort();
   for (let url of sourceUrls) {
     const tex = await tl.loadAsync(url);
     tex.colorSpace = THREE.SRGBColorSpace;
@@ -247,174 +195,205 @@ async function init() {
     imageAspects.push(tex.image.width / tex.image.height);
   }
 
-  // Mobile-first: base container width on viewport
+  if (loadedTextures.length === 0) return;
+
   const baseWidth = 100;
-  const baseHeight = baseWidth / camera.aspect;
+  const baseHeight = baseWidth / (window.innerWidth / window.innerHeight);
   
-  currentGridCenter = new THREE.Vector3(0, 0, 0);
-  // Create massive macro view (150 rows) for high density
-  currentGrid = new PhotoGrid(currentGridCenter, baseWidth, baseHeight, 150, [], 1.0);
-  gridStack.push(currentGrid);
+  // Level 0: Grid Mosaic
+  currentGrid = new PhotoGrid(new THREE.Vector3(0, 0, 0), baseWidth, baseHeight, GRID_ROWS);
   
-  currentZoomLevels = calculateZoomLevels(baseWidth, baseHeight);
-  currentZoomIndex = 3;
-  camera.position.z = currentZoomLevels[currentZoomIndex];
+  // Find a portal photo close to the center
+  let bestDistance = Infinity;
+  let portalPos = new THREE.Vector3();
+  let portalScale = new THREE.Vector3();
   
+  // We need to parse instance matrices
+  const dummyMatrix = new THREE.Matrix4();
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  
+  currentGrid.meshes.forEach(mesh => {
+    for (let i = 0; i < mesh.count; i++) {
+      mesh.getMatrixAt(i, dummyMatrix);
+      dummyMatrix.decompose(position, quaternion, scale);
+      
+      const dist = position.distanceTo(new THREE.Vector3(0, 0, 0));
+      if (dist < bestDistance) {
+        bestDistance = dist;
+        portalPos.copy(position);
+        portalScale.copy(scale);
+      }
+    }
+  });
+
+  // Level 1+: Sequential Z-Stack behind Portal
+  let currentX = portalPos.x;
+  let currentY = portalPos.y;
+  
+  for (let i = 0; i < loadedTextures.length; i++) {
+    const tex = loadedTextures[i];
+    
+    // The first layer in the sequence must perfectly cover the grid photo
+    // We render the sequence layer slightly in front of the grid (Z=0.001) so it occludes the grid photo smoothly.
+    let layerScaleMultiplier = Math.pow(SCALE_FACTOR, i);
+    let currentWidth = portalScale.x * layerScaleMultiplier;
+    let currentHeight = portalScale.y * layerScaleMultiplier;
+    
+    if (i > 0) {
+      const prevScaleMult = Math.pow(SCALE_FACTOR, i - 1);
+      const prevWidth = portalScale.x * prevScaleMult;
+      const prevHeight = portalScale.y * prevScaleMult;
+      
+      const maxOffsetX = (prevWidth - currentWidth) / 2 * 0.7; 
+      const maxOffsetY = (prevHeight - currentHeight) / 2 * 0.7;
+      
+      const randX = (Math.sin(i * 12.9898) * 43758.5453 % 1) * 2 - 1;
+      const randY = (Math.sin(i * 78.233) * 43758.5453 % 1) * 2 - 1;
+      
+      currentX += randX * maxOffsetX;
+      currentY += randY * maxOffsetY;
+    }
+    
+    const geometry = new THREE.PlaneGeometry(currentWidth, currentHeight);
+    const material = new THREE.MeshBasicMaterial({ 
+      map: tex,
+      depthTest: false,
+      depthWrite: false,
+      transparent: true,
+      opacity: i === 0 ? 1.0 : 0.0 
+    });
+    
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(currentX, currentY, 0.001); 
+    mesh.renderOrder = 10 + i; // Sequence renders on top of grid
+    
+    scene.add(mesh);
+    
+    sequenceLayers.push({
+      mesh: mesh,
+      x: currentX,
+      y: currentY,
+      width: currentWidth,
+      index: i
+    });
+  }
+
+  // Create GSAP ScrollTrigger Timeline
+  setupScrollTimeline(portalPos);
+
   animate();
 }
 
-window.addEventListener('wheel', (e) => {
-  if (isAnimating) return;
+function setupScrollTimeline(portalPos) {
+  // Setup a proxy object to hold our animated camera properties
+  const camState = {
+    z: BASE_CAMERA_Z,
+    x: 0,
+    y: 0,
+    zoomLevel: 0 // sequence zoom level
+  };
   
-  if (e.deltaY > 0 && currentZoomIndex < currentZoomLevels.length - 1) {
-    currentZoomIndex++;
-    animateToZoomLevel(currentZoomIndex);
-  } else if (e.deltaY < 0 && currentZoomIndex > 0) {
-    currentZoomIndex--;
-    animateToZoomLevel(currentZoomIndex);
-  }
-});
+  camera.position.set(0, 0, BASE_CAMERA_Z);
 
-function animateToZoomLevel(index) {
-  isAnimating = true;
-  const targetZ = currentGridCenter.z + currentZoomLevels[index];
-  const targetOpacity = index === currentZoomLevels.length - 1 ? 1.0 : 0.0;
-
-  gsap.to(camera.position, {
-    z: targetZ,
-    duration: 1.5,
-    ease: "power2.inOut",
-    onComplete: () => { isAnimating = false; }
+  const tl = gsap.timeline({
+    scrollTrigger: {
+      trigger: ".scroll-container",
+      start: "top top",
+      end: "bottom bottom",
+      scrub: 0.5, // Smooth scrubbing
+    }
   });
 
-  // Animate the opacity of the current global master grid (gridStack[0])
-  if (gridStack.length > 0 && currentGrid === gridStack[0]) {
-    gsap.to(gridStack[0].uTintOpacity, {
-      value: targetOpacity,
-      duration: 1.5,
-      ease: "power2.inOut"
-    });
-  }
-}
-
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-
-window.addEventListener('click', (e) => {
-  if (isAnimating) return;
-
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-
-  raycaster.setFromCamera(mouse, camera);
-  const intersects = raycaster.intersectObjects(currentGrid.meshes);
-
-  if (intersects.length > 0) {
-    const intersect = intersects[0];
-    const instanceId = intersect.instanceId;
-    const mesh = intersect.object;
-    const texIndex = mesh.userData.texIndex;
-
-    const matrix = new THREE.Matrix4();
-    mesh.getMatrixAt(instanceId, matrix);
-    const position = new THREE.Vector3();
-    const quaternion = new THREE.Quaternion();
-    const scale = new THREE.Vector3();
-    matrix.decompose(position, quaternion, scale);
-
-    zoomIntoPortal(position, scale.x, scale.y, texIndex);
-  }
-});
-
-function zoomIntoPortal(targetPos, w, h, textureIndex) {
-  if (isAnimating) return;
-  isAnimating = true;
+  // Phase 1 -> 2: Fade out illusion, move closer to grid
+  tl.to(currentGrid.uTintOpacity, {
+    value: 0.0,
+    ease: "none",
+    duration: 1
+  }, 0);
   
-  try {
-    zoomPath.push(textureIndex);
+  tl.to(camState, {
+    z: 2.0, // Move closer to grid
+    ease: "power2.in",
+    duration: 1
+  }, 0);
 
-    // Check if we've exhausted the unique unseen images pool
-    const isLoopPortal = zoomPath.length >= loadedTextures.length - 1;
-    console.log(`[Deep Zoom] Portal Clicked. zoomPath length: ${zoomPath.length}, isLoopPortal: ${isLoopPortal}`);
+  // Phase 2 -> 3: Interpolate X/Y to aim perfectly at the portal
+  tl.to(camState, {
+    x: portalPos.x,
+    y: portalPos.y,
+    ease: "power2.inOut",
+    duration: 1
+  }, 1);
+  
+  tl.to(camState, {
+    z: 0.5, // Even closer to portal
+    ease: "none",
+    duration: 1
+  }, 1);
 
-    // New grid is strictly inside the bounds of the clicked image
-    // Placed slightly in front (+z) to occlude the parent image
-    const newCenter = new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z + 0.001);
-    let nextGrid;
-    
-    let gridW = w;
-    let gridH = h;
-
-    if (isLoopPortal) {
-      // Infinite Loop Trigger: Create the Miniature Master Grid!
-      const camAspect = camera.aspect;
-      if (w / h > camAspect) {
-        gridH = w / camAspect;
-      } else {
-        gridW = h * camAspect;
-      }
-      console.log(`[Deep Zoom] Spawning Miniature Master Grid at size: ${gridW}x${gridH}`);
-      nextGrid = new PhotoGrid(newCenter, gridW, gridH, 150, [], 1.0);
-    } else {
-      // Normal deep zoom exploration
-      nextGrid = new PhotoGrid(newCenter, w, h, 20, zoomPath, 0.0);
-    }
-    
-    gridStack.push(nextGrid);
-    currentGrid = nextGrid;
-
-    currentGridCenter.copy(newCenter);
-    currentZoomLevels = calculateZoomLevels(gridW, gridH);
-    
-    // Animate perfectly into the newly spawned macro view.
-    currentZoomIndex = 3; 
-    const targetCameraZ = currentGridCenter.z + currentZoomLevels[3];
-    
-    console.log(`[Deep Zoom] Preparing to animate camera to Z: ${targetCameraZ}`);
-
-    // Execute the GSAP tween
-    gsap.to(camera.position, {
-      x: currentGridCenter.x,
-      y: currentGridCenter.y,
-      z: targetCameraZ,
-      duration: 2,
-      ease: "power3.inOut",
-      onComplete: () => {
-        try {
-          if (isLoopPortal) {
-            console.log(`[Deep Zoom] Animation complete. Triggering instant Teleport...`);
-            
-            // THE TELEPORT: Instantly snap back to the Global Master Grid
-            const rootGrid = gridStack[0];
-            currentGrid = rootGrid;
-            currentGridCenter.copy(rootGrid.center);
-            currentZoomLevels = calculateZoomLevels(rootGrid.width, rootGrid.height);
-            currentZoomIndex = 3;
-            
-            camera.position.set(currentGridCenter.x, currentGridCenter.y, currentGridCenter.z + currentZoomLevels[3]);
-            
-            // Memory Cleanup: Destroy all intermediate fractal grids
-            console.log(`[Deep Zoom] Cleaning up ${gridStack.length - 1} nested grids from memory.`);
-            for (let i = 1; i < gridStack.length; i++) {
-              if (gridStack[i] && typeof gridStack[i].destroy === 'function') {
-                gridStack[i].destroy();
-              }
+  // Phase 3 -> 4: Dive into the Infinite Z-Stack sequence
+  // The sequence has N layers. We map timeline progress to `zoomLevel`.
+  tl.to(camState, {
+    zoomLevel: sequenceLayers.length - 1,
+    ease: "none",
+    duration: 3 // Takes up the majority of the scroll space
+  }, 2);
+  
+  // Use GSAP's onUpdate to calculate exponential Z and sequence X/Y
+  tl.eventCallback("onUpdate", () => {
+    // If we are past Phase 2, calculate exponential micro-scaling
+    if (tl.progress() > 0.4) { 
+      // The timeline is 5 units long (0-1, 1-2, 2-5). 
+      // Progress 0.4 corresponds to start of Phase 3->4 (time 2.0 / 5.0)
+      
+      const zScale = Math.pow(SCALE_FACTOR, camState.zoomLevel);
+      // At zoomLevel=0, we are at layer0 perfectly. To make it smooth,
+      // we offset the base Z from where Phase 2 left off.
+      // E.g. Phase 2 ended at Z=0.5. At zoomLevel=0, we transition from 0.5 downwards.
+      
+      const transitionFactor = Math.max(0, (tl.time() - 2) / 3); // 0 to 1 through phase 4
+      
+      if (transitionFactor > 0) {
+        camera.position.z = 0.5 * zScale;
+        
+        // Sequence X/Y Interpolation
+        let startIndex = Math.floor(camState.zoomLevel);
+        let endIndex = Math.min(startIndex + 1, sequenceLayers.length - 1);
+        let progress = camState.zoomLevel - startIndex;
+        
+        const easeProgress = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+        
+        camera.position.x = sequenceLayers[startIndex].x + (sequenceLayers[endIndex].x - sequenceLayers[startIndex].x) * easeProgress;
+        camera.position.y = sequenceLayers[startIndex].y + (sequenceLayers[endIndex].y - sequenceLayers[startIndex].y) * easeProgress;
+        
+        // Opacity Fades
+        sequenceLayers.forEach((layer, i) => {
+          if (i > 0) {
+            const fadeStart = i - 0.8;
+            const fadeEnd = i - 0.2;
+            if (camState.zoomLevel <= fadeStart) {
+              layer.mesh.material.opacity = 0.0;
+            } else if (camState.zoomLevel >= fadeEnd) {
+              layer.mesh.material.opacity = 1.0;
+            } else {
+              layer.mesh.material.opacity = (camState.zoomLevel - fadeStart) / (fadeEnd - fadeStart);
             }
-            gridStack.length = 1; // Preserve root grid
-            zoomPath = [];
-            console.log(`[Deep Zoom] Teleport complete. Memory cleaned.`);
           }
-        } catch (e) {
-          console.error(`[Deep Zoom] Error during onComplete teleport/cleanup:`, e);
-        } finally {
-          isAnimating = false;
-        }
+        });
+      } else {
+        camera.position.z = camState.z;
+        camera.position.x = camState.x;
+        camera.position.y = camState.y;
       }
-    });
-  } catch (err) {
-    console.error(`[Deep Zoom] Fatal error in zoomIntoPortal:`, err);
-    isAnimating = false;
-  }
+    } else {
+      // Phase 1 and 2
+      camera.position.z = camState.z;
+      camera.position.x = camState.x;
+      camera.position.y = camState.y;
+    }
+  });
 }
 
 window.addEventListener('resize', () => {
@@ -428,5 +407,4 @@ function animate() {
   renderer.render(scene, camera);
 }
 
-// Start app
 init().catch(console.error);
